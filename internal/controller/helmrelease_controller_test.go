@@ -39,6 +39,7 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -2423,6 +2424,109 @@ func TestHelmReleaseReconciler_reconcileReleaseDeletion(t *testing.T) {
 		g.Expect(err).ToNot(HaveOccurred())
 	})
 
+	t.Run("SA check with kubeConfig uses remote cluster client", func(t *testing.T) {
+		g := NewWithT(t)
+
+		// Create a test namespace.
+		ns, err := testEnv.CreateNamespace(context.TODO(), "reconcile-release-deletion")
+		g.Expect(err).ToNot(HaveOccurred())
+		t.Cleanup(func() {
+			_ = testEnv.Delete(context.TODO(), ns)
+		})
+
+		// Create the ServiceAccount that will be checked on the "remote" cluster.
+		sa := &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "remote-sa",
+				Namespace: ns.Name,
+			},
+		}
+		g.Expect(testEnv.Create(context.TODO(), sa)).To(Succeed())
+		t.Cleanup(func() {
+			_ = testEnv.Delete(context.TODO(), sa)
+		})
+
+		// Build a kubeconfig secret pointing at the test cluster itself
+		// (which acts as the "remote" cluster for this test).
+		restCfg := testEnv.GetConfig()
+		kubeCfgBytes, err := generateKubeConfigBytes(restCfg)
+		g.Expect(err).ToNot(HaveOccurred())
+
+		kubeCfgSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "kubeconfig-remote",
+				Namespace: ns.Name,
+			},
+			Data: map[string][]byte{
+				kube.DefaultKubeConfigSecretKey: kubeCfgBytes,
+			},
+		}
+		g.Expect(testEnv.Create(context.TODO(), kubeCfgSecret)).To(Succeed())
+		t.Cleanup(func() {
+			_ = testEnv.Delete(context.TODO(), kubeCfgSecret)
+		})
+
+		// Create a test Helm release storage mock.
+		rls := testutil.BuildRelease(&helmrelease.MockReleaseOptions{
+			Name:      "reconcile-delete",
+			Namespace: ns.Name,
+			Version:   1,
+			Chart:     testutil.BuildChart(testutil.ChartWithTestHook()),
+			Status:    helmreleasecommon.StatusDeployed,
+		})
+
+		obj := &v2.HelmRelease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "reconcile-delete",
+				Namespace:         ns.Name,
+				DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			},
+			Spec: v2.HelmReleaseSpec{
+				ServiceAccountName: "remote-sa",
+				KubeConfig: &meta.KubeConfigReference{
+					SecretRef: &meta.SecretKeyReference{
+						Name: "kubeconfig-remote",
+					},
+				},
+			},
+			Status: v2.HelmReleaseStatus{
+				StorageNamespace: ns.Name,
+				History: v2.Snapshots{
+					release.ObservedToSnapshot(release.ObserveRelease(rls)),
+				},
+			},
+		}
+
+		r := &HelmReleaseReconciler{
+			Client:           testEnv.Client,
+			APIReader:        testEnv.Client,
+			GetClusterConfig: GetTestClusterConfig,
+			EventRecorder:    record.NewFakeRecorder(32),
+		}
+
+		// Store the Helm release mock in the test namespace.
+		getter, err := r.buildRESTClientGetter(context.TODO(), obj)
+		g.Expect(err).ToNot(HaveOccurred())
+
+		cfg, err := action.NewConfigFactory(getter, action.WithStorage(helmdriver.SecretsDriverName, obj.Status.StorageNamespace))
+		g.Expect(err).ToNot(HaveOccurred())
+
+		store := helmstorage.Init(cfg.Driver)
+		g.Expect(store.Create(rls)).To(Succeed())
+
+		// Reconcile the deletion — SA exists on "remote" cluster, should proceed.
+		err = r.reconcileReleaseDeletion(context.TODO(), obj)
+		g.Expect(err).ToNot(HaveOccurred())
+
+		// Verify status was cleared (uninstallation completed).
+		g.Expect(obj.Status.StorageNamespace).To(BeEmpty())
+		g.Expect(obj.Status.History).To(BeNil())
+
+		// Verify Helm release has been uninstalled.
+		_, err = store.History(rls.Name)
+		g.Expect(err).To(MatchError(helmdriver.ErrReleaseNotFound))
+	})
+
 	t.Run("error when REST client getter construction fails", func(t *testing.T) {
 		g := NewWithT(t)
 
@@ -2490,10 +2594,12 @@ func TestHelmReleaseReconciler_reconcileReleaseDeletion(t *testing.T) {
 			},
 		}
 
+		fakeRecorder := record.NewFakeRecorder(32)
 		r := &HelmReleaseReconciler{
 			Client:           testEnv.Client,
 			APIReader:        testEnv.Client,
 			GetClusterConfig: GetTestClusterConfig,
+			EventRecorder:    fakeRecorder,
 		}
 
 		// Store the Helm release mock in the test namespace.
@@ -2518,9 +2624,16 @@ func TestHelmReleaseReconciler_reconcileReleaseDeletion(t *testing.T) {
 		// Verify Helm release has not been uninstalled.
 		_, err = store.History(rls.Name)
 		g.Expect(err).ToNot(HaveOccurred())
+
+		// Verify a descriptive warning event was emitted.
+		g.Expect(fakeRecorder.Events).To(HaveLen(1))
+		event := <-fakeRecorder.Events
+		g.Expect(event).To(ContainSubstring("skipping Helm release uninstallation"))
+		g.Expect(event).To(ContainSubstring("ServiceAccount"))
+		g.Expect(event).To(ContainSubstring("missing-sa"))
 	})
 
-	t.Run("error when ServiceAccount existence check fails", func(t *testing.T) {
+	t.Run("non-not-found error on ServiceAccount check allows finalization", func(t *testing.T) {
 		g := NewWithT(t)
 
 		var (
@@ -2538,9 +2651,11 @@ func TestHelmReleaseReconciler_reconcileReleaseDeletion(t *testing.T) {
 			},
 		})
 
+		fakeRecorder := record.NewFakeRecorder(32)
 		r := &HelmReleaseReconciler{
 			Client:           c.Build(),
 			GetClusterConfig: GetTestClusterConfig,
+			EventRecorder:    fakeRecorder,
 		}
 
 		obj := &v2.HelmRelease{
@@ -2558,15 +2673,17 @@ func TestHelmReleaseReconciler_reconcileReleaseDeletion(t *testing.T) {
 		}
 
 		// Reconcile the actual deletion of the Helm release.
+		// Non-not-found errors should allow finalization (consistent with
+		// kustomize-controller), instead of blocking with retry.
 		err := r.reconcileReleaseDeletion(context.TODO(), obj)
-		g.Expect(errors.Is(err, mockErr)).To(BeTrue())
-		g.Expect(obj.Status.Conditions).To(conditions.MatchConditions([]metav1.Condition{
-			*conditions.FalseCondition(meta.ReadyCondition, v2.UninstallFailedReason,
-				"failed to confirm ServiceAccount '%s' can be used to uninstall release", serviceAccount),
-		}))
+		g.Expect(err).ToNot(HaveOccurred())
 
-		// Verify status of Helm release has not been updated.
-		g.Expect(obj.Status.StorageNamespace).ToNot(BeEmpty())
+		// Verify a warning event was emitted about the failure.
+		g.Expect(fakeRecorder.Events).To(HaveLen(1))
+		event := <-fakeRecorder.Events
+		g.Expect(event).To(ContainSubstring("failed to confirm ServiceAccount"))
+		g.Expect(event).To(ContainSubstring(serviceAccount))
+		g.Expect(event).To(ContainSubstring("allowing finalization"))
 	})
 
 	t.Run("error when Helm release uninstallation fails", func(t *testing.T) {
@@ -4080,4 +4197,30 @@ func Test_TryMutateChartWithSourceRevision(t *testing.T) {
 		})
 	}
 
+}
+
+// generateKubeConfigBytes converts a rest.Config into kubeconfig YAML bytes
+// suitable for storing in a Secret. This is used by tests that need to
+// simulate a spec.kubeConfig pointing at the test cluster.
+func generateKubeConfigBytes(cfg *rest.Config) ([]byte, error) {
+	apiConfig := clientcmdapi.NewConfig()
+	apiConfig.Clusters["test"] = &clientcmdapi.Cluster{
+		Server:                   cfg.Host,
+		CertificateAuthorityData: cfg.CAData,
+		InsecureSkipTLSVerify:    cfg.Insecure,
+	}
+	apiConfig.AuthInfos["test"] = &clientcmdapi.AuthInfo{
+		ClientCertificateData: cfg.CertData,
+		ClientKeyData:         cfg.KeyData,
+		Token:                 cfg.BearerToken,
+		Username:              cfg.Username,
+		Password:              cfg.Password,
+	}
+	apiConfig.Contexts["test"] = &clientcmdapi.Context{
+		Cluster:  "test",
+		AuthInfo: "test",
+	}
+	apiConfig.CurrentContext = "test"
+
+	return clientcmd.Write(*apiConfig)
 }

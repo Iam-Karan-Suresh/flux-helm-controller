@@ -521,34 +521,59 @@ func (r *HelmReleaseReconciler) reconcileReleaseDeletion(ctx context.Context, ob
 	// If the ServiceAccount does not exist, for example, because the
 	// namespace is being terminated, we should not attempt to uninstall the
 	// release.
-	if obj.Spec.KubeConfig == nil {
-		cfg, err := getter.ToRESTConfig()
-		if err != nil {
-			// This should never happen.
-			return err
+	// When spec.kubeConfig is configured, the ServiceAccount is checked on
+	// the remote cluster (via the getter's REST config) instead of the
+	// local cluster.
+	cfg, err := getter.ToRESTConfig()
+	if err != nil {
+		// This should never happen.
+		return err
+	}
+
+	if serviceAccount := cfg.Impersonate.UserName; serviceAccount != "" {
+		i := strings.LastIndex(serviceAccount, ":")
+		if i != -1 {
+			serviceAccount = serviceAccount[i+1:]
 		}
 
-		if serviceAccount := cfg.Impersonate.UserName; serviceAccount != "" {
-			i := strings.LastIndex(serviceAccount, ":")
-			if i != -1 {
-				serviceAccount = serviceAccount[i+1:]
+		// Determine which client to use for the ServiceAccount lookup.
+		// When kubeConfig is set, the ServiceAccount is expected to exist
+		// on the remote cluster, not the local one.
+		saClient := r.Client
+		if obj.Spec.KubeConfig != nil {
+			remoteClient, err := client.New(cfg, client.Options{})
+			if err != nil {
+				msg := fmt.Sprintf("failed to build remote client to confirm ServiceAccount '%s/%s' exists: %s",
+					obj.GetNamespace(), serviceAccount, err)
+				ctrl.LoggerFrom(ctx).Error(err, msg)
+				r.Eventf(obj, corev1.EventTypeWarning, v2.UninstallFailedReason, msg)
+				// Allow finalization to proceed, consistent with kustomize-controller.
+				return nil
+			}
+			saClient = remoteClient
+		}
+
+		if err = saClient.Get(ctx, types.NamespacedName{
+			Namespace: obj.GetNamespace(),
+			Name:      serviceAccount,
+		}, &corev1.ServiceAccount{}); err != nil {
+			if client.IgnoreNotFound(err) == nil {
+				// The ServiceAccount does not exist. Skip uninstallation
+				// to avoid acting with unknown permissions.
+				msg := fmt.Sprintf("skipping Helm release uninstallation: ServiceAccount '%s/%s' not found",
+					obj.GetNamespace(), serviceAccount)
+				ctrl.LoggerFrom(ctx).Error(err, msg)
+				r.Eventf(obj, corev1.EventTypeWarning, v2.UninstallFailedReason, msg)
+				return nil
 			}
 
-			if err = r.Client.Get(ctx, types.NamespacedName{
-				Namespace: obj.GetNamespace(),
-				Name:      serviceAccount,
-			}, &corev1.ServiceAccount{}); err != nil {
-				if client.IgnoreNotFound(err) == nil {
-					// Without a ServiceAccount reference, we cannot confirm
-					// the ServiceAccount exists.
-					ctrl.LoggerFrom(ctx).Error(err, "skipping Helm release uninstallation")
-					return nil
-				}
-
-				conditions.MarkFalse(obj, meta.ReadyCondition, v2.UninstallFailedReason,
-					"failed to confirm ServiceAccount '%s' can be used to uninstall release: %s", serviceAccount, err)
-				return err
-			}
+			// For non-not-found errors, log and emit an event but allow
+			// finalization to proceed, consistent with kustomize-controller.
+			msg := fmt.Sprintf("failed to confirm ServiceAccount '%s/%s' exists, allowing finalization: %s",
+				obj.GetNamespace(), serviceAccount, err)
+			ctrl.LoggerFrom(ctx).Error(err, msg)
+			r.Eventf(obj, corev1.EventTypeWarning, v2.UninstallFailedReason, msg)
+			return nil
 		}
 	}
 
